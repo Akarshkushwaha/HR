@@ -28,7 +28,7 @@
 | 24 | Response serialization | Datetimes, including nested history changes, remain ISO strings or BSON objects. | Read punch fields and history `from`/`to`. | Recursively convert all instants to integer epoch milliseconds. |
 | 25 | `list_attendance` | Materializes and sorts every matching document in Python. | Request 20 rows from 100,000 records. | Indexed server-side sort, skip, limit and filtered count. |
 | 26 | `list_attendance` | Missing secondary sort makes ties unstable. | Several employees have records on the same date. | Sort date descending, then employee code ascending. |
-| 27 | `list_attendance` | Invalid dates, inverted ranges and unsupported statuses are accepted. | Query February 30 or `date_from > date_to`. | Validate calendar strings, ordering and status enum; return 422. |
+| 27 | `list_attendance` | Invalid dates, inverted ranges and unsupported statuses are accepted. | Query February 30, an empty date filter, or `date_from > date_to`. | Validate calendar strings, ordering and status enum; return 422. |
 | 28 | `list_attendance` | Legacy defaults are not supplied. | Seed a record without history or half_day. | Return history `[]`, half_day false and other specified defaults. |
 
 Examined and retained: `load_dotenv()` already leaves real environment variables in control; synchronous PyMongo is suitable for FastAPI's synchronous endpoints, which run in its worker pool; the fixed UTC+05:30 offset is appropriate for the contract's IST; absence of authentication is explicitly within assignment scope. Extra body fields remain ignored, including client-supplied derived values, as the contract requires. MongoDB's internal `_id` remains useful for atomic updates but is never employee identity or an attendance response field.

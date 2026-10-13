@@ -1,6 +1,7 @@
 """Employee Attendance & Analytics API. All application code lives in this file."""
 import os
 import re
+from calendar import monthrange
 from contextlib import asynccontextmanager
 from datetime import date as CalendarDate, datetime, time, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
@@ -83,21 +84,18 @@ def month_bounds(month):
     if not isinstance(month, str) or not re.fullmatch(r"\d{4}-(0[1-9]|1[0-2])", month):
         invalid("Expected YYYY-MM", "query")
     first = parse_date(month + "-01")
-    if first.year == 9999 and first.month == 12:
-        invalid("Month outside supported date range", "query")
-    following = (first.replace(day=28) + timedelta(days=4)).replace(day=1)
-    return first, following - timedelta(days=1)
+    return first, first.replace(day=monthrange(first.year, first.month)[1])
 
 
 def validate_range(start, end, maximum=None):
-    if start and end:
+    if start is not None and end is not None:
         a, b = parse_date(start), parse_date(end)
         if b < a or (maximum and (b - a).days + 1 > maximum):
             invalid("Invalid date range", "query")
     else:
-        if start:
+        if start is not None:
             parse_date(start)
-        if end:
+        if end is not None:
             parse_date(end)
 
 

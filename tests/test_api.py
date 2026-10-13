@@ -1,16 +1,20 @@
 """Contract tests against real MongoDB; all fixtures are synthetic, not kit dumps."""
 import json
 import os
+import re
+import socket
+import subprocess
+import sys
+import urllib.request
 import time as clock
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
 from threading import Barrier
-from uuid import uuid4
+from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
-from pymongo import MongoClient
 
 from app import main as m
 
@@ -22,21 +26,6 @@ def ms(local):
 def employee(code="EMP1001", department="Alpha", joined="2026-07-01", **kwargs):
     return {"emp_code": code, "name": "Test " + code, "email": code + "@example.test",
             "department": department, "joined_on": joined, **kwargs}
-
-
-@pytest.fixture
-def api(monkeypatch):
-    connection = MongoClient(os.getenv("TEST_MONGO_URI", "mongodb://localhost:27018"),
-                             tz_aware=True, serverSelectionTimeoutMS=2000)
-    connection.admin.command("ping")
-    database = connection["hrone_test_" + uuid4().hex]
-    monkeypatch.setattr(m, "db", database)
-    monkeypatch.setattr(m, "client", connection)
-    with TestClient(m.app) as http:
-        try:
-            yield http
-        finally:
-            connection.drop_database(database.name)
 
 
 def add_employee(api, **kwargs):
@@ -77,6 +66,8 @@ def test_creation_pagination_and_defaults(api):
     assert api.get("/attendance", params={"page_size": 101}).status_code == 422
     assert api.get("/attendance", params={"date_from": "2026-07-03", "date_to": "2026-07-01"}).status_code == 422
     assert api.get("/attendance", params={"date_from": "2026-02-30"}).status_code == 422
+    assert api.get("/attendance", params={"date_from": ""}).status_code == 422
+    assert api.get("/admin/explain/attendance_list", params={"date_to": ""}).status_code == 422
     assert api.get("/attendance", params={"status": "OTHER"}).status_code == 422
     assert api.get("/health").json() == {"status": "ok"}
 
@@ -299,6 +290,101 @@ def test_health_database_unavailable(monkeypatch):
             raise m.PyMongoError("unavailable")
     monkeypatch.setattr(m, "db", Unavailable())
     assert TestClient(m.app).get("/health").status_code == 503
+
+
+def test_calendar_month_boundaries(api):
+    add_employee(api, joined="2024-02-15")
+    february = api.get("/analytics/employees/EMP1001/monthly", params={"month": "2024-02"}).json()
+    assert february["working_days"] == 11
+    december = api.get("/analytics/employees/EMP1001/monthly", params={"month": "9999-12"})
+    assert december.status_code == 200, december.text
+    assert december.json()["working_days"] == 23
+
+
+def test_default_clock_read_only_fields_and_exact_day_limit(api):
+    supplied = {**employee(), "created_at": 100000000000, "_id": "client-id"}
+    created = api.post("/employees", json=supplied)
+    assert created.status_code == 201 and created.json()["created_at"] != supplied["created_at"]
+    assert "_id" not in created.json()
+    before = int(datetime.now(timezone.utc).timestamp()) * 1000
+    entered = api.post("/attendance/punch-in", json={"emp_code": "EMP1001", "work_hours": 99,
+        "late_minutes": 999, "overtime_minutes": 999, "half_day": True, "history": [{"by": "client"}]})
+    assert entered.status_code == 201
+    doc = entered.json()
+    assert before <= doc["punch_in"] <= int(datetime.now(timezone.utc).timestamp()) * 1000
+    assert doc["work_hours"] is None and doc["overtime_minutes"] == 0 and doc["half_day"] is False
+    assert doc["history"] == []
+    closed = api.post("/attendance/punch-out", json={"emp_code": "EMP1001", "punched_at": doc["punch_in"] + 86400000})
+    assert closed.status_code == 200 and closed.json()["work_hours"] == 24
+
+
+def test_most_recent_punchout_does_not_close_an_older_open_record(api):
+    add_employee(api)
+    assert punch(api, "2026-07-06T09:30:00").status_code == 201
+    assert punch(api, "2026-07-07T09:30:00").status_code == 201
+    body = {"emp_code": "EMP1001", "punched_at": ms("2026-07-07T18:30:00")}
+    assert api.post("/attendance/punch-out", json=body).status_code == 200
+    assert api.post("/attendance/punch-out", json=body).status_code == 409
+    older = api.get("/attendance", params={"date_from": "2026-07-06", "date_to": "2026-07-06"}).json()["items"][0]
+    assert older["punch_out"] is None
+
+
+def test_readme_workflow(api):
+    readme = (Path(__file__).resolve().parents[1] / "README.md").read_text(encoding="utf-8")
+    bodies = [json.loads(block) for block in re.findall(r"```json\n(.*?)\n\s*```", readme, re.S)]
+    assert len(bodies) == 4
+    assert api.post("/employees", json=bodies[0]).status_code == 201
+    assert api.post("/attendance/punch-in", json=bodies[1]).status_code == 201
+    closed = api.post("/attendance/punch-out", json=bodies[2])
+    assert closed.status_code == 200, closed.text
+    doc = closed.json()
+    assert (doc["date"], doc["work_hours"], doc["late_minutes"], doc["overtime_minutes"], doc["half_day"], doc["history"]) == (
+        "2026-07-06", 9.0, 0, 0, False, [])
+    corrected = api.patch("/attendance/EMP2001/2026-07-06", json=bodies[3])
+    assert corrected.status_code == 200
+    assert corrected.json()["work_hours"] == 10.0 and corrected.json()["overtime_minutes"] == 60
+    assert len(corrected.json()["history"]) == 1
+
+
+def test_fresh_process_startup_environment_and_preseed(api, startup_dir):
+    # A fresh process must read injected environment values, build indexes on seeded
+    # collections, and start using only application files from a clean directory.
+    tmp_path = startup_dir
+    app_dir = tmp_path / "app"
+    app_dir.mkdir()
+    source = Path(__file__).resolve().parents[1] / "app"
+    for name in ["main.py", "__init__.py"]:
+        (app_dir / name).write_text((source / name).read_text(encoding="utf-8"), encoding="utf-8")
+    (tmp_path / ".env").write_text("MONGO_URI=mongodb://localhost:9\nMONGO_DB=incorrect_database\n")
+    add_employee(api)
+    m.db.employees.drop_indexes()
+    m.db.attendance_logs.drop_indexes()
+    with socket.socket() as port_probe:
+        port_probe.bind(("127.0.0.1", 0))
+        port = port_probe.getsockname()[1]
+    environment = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
+    environment.update({"MONGO_URI": os.getenv("TEST_MONGO_URI", "mongodb://localhost:27018"), "MONGO_DB": m.db.name})
+    started = clock.monotonic()
+    process = subprocess.Popen([sys.executable, "-m", "uvicorn", "app.main:app", "--port", str(port)],
+                               cwd=tmp_path, env=environment, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        url = f"http://127.0.0.1:{port}"
+        while clock.monotonic() - started < 20:
+            try:
+                with urllib.request.urlopen(url + "/health", timeout=1) as result:
+                    if result.status == 200:
+                        break
+            except (OSError, TimeoutError):
+                assert process.poll() is None, "API exited before readiness"
+        else:
+            pytest.fail("Fresh API did not become ready within 20 seconds")
+        with urllib.request.urlopen(url + "/employees", timeout=2) as result:
+            assert json.load(result)["items"][0]["emp_code"] == "EMP1001"
+        assert m.db.employees.index_information()["employee_code"]["unique"] is True
+        assert m.db.attendance_logs.index_information()["employee_date"]["unique"] is True
+    finally:
+        process.terminate()
+        process.wait(timeout=5)
 
 
 @pytest.mark.skipif(os.getenv("RUN_SCALE_TEST") != "1", reason="Opt-in 100,000-record check")
